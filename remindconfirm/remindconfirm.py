@@ -263,6 +263,7 @@ class RemindConfirm(commands.Cog):
         async with self.config.guild_from_id(guild_id).reminders() as reminders:
             reminders[reminder_id] = data
 
+    def _build_status_embed(self, rdata: dict) -> discord.Embed:
         """Build the recurring nag embed showing confirmation progress."""
         pending_users = _pending_users(rdata)
         
