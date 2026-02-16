@@ -1,0 +1,13 @@
+{
+    "author": ["cogs-cogs"],
+    "install_msg": "RemindConfirm installed! Use `[p]rc` to manage recurring confirmation reminders.",
+    "name": "RemindConfirm",
+    "short": "Recurring reminders that require reaction confirmations from specified users.",
+    "description": "Schedule reminders on an interval or weekly basis. Each fire starts a nag loop that re-sends the message until all specified users confirm via reaction emoji, or the nag window expires. Confirmation state carries over within each occurrence.",
+    "end_user_data_statement": "This cog stores user IDs for reminder targets and confirmation tracking.",
+    "min_bot_version": "3.5.0",
+    "hidden": false,
+    "disabled": false,
+    "type": "COG",
+    "tags": ["reminder", "confirmation", "reaction", "recurring", "utility"]
+}
