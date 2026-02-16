@@ -264,7 +264,7 @@ class RemindConfirm(commands.Cog):
 
         embed = discord.Embed(
             title="⏰ Reminder",
-            description=rdata["message"],
+            description=f"### {rdata['message']}",
             colour=discord.Colour.orange() if pending else discord.Colour.green(),
         )
 
@@ -295,7 +295,7 @@ class RemindConfirm(commands.Cog):
         """Build the embed shown when all users have confirmed."""
         embed = discord.Embed(
             title="✅ Reminder — All confirmed!",
-            description=rdata["message"],
+            description=f"### {rdata['message']}",
             colour=discord.Colour.green(),
         )
         embed.add_field(name="Confirmed by", value=_confirmed_mentions(rdata), inline=False)
@@ -306,7 +306,7 @@ class RemindConfirm(commands.Cog):
         """Build the embed shown when the nag window expires without full confirmation."""
         embed = discord.Embed(
             title="⏰ Reminder — nag window expired",
-            description=rdata["message"],
+            description=f"### {rdata['message']}",
             colour=discord.Colour.red(),
         )
         embed.add_field(
@@ -325,7 +325,7 @@ class RemindConfirm(commands.Cog):
             colour=discord.Colour.blurple(),
         )
         embed.add_field(name="ID", value=f"`{rdata['reminder_id']}`", inline=True)
-        embed.add_field(name="Message", value=rdata["message"], inline=False)
+        embed.add_field(name="Message", value=f"### {rdata['message']}", inline=False)
         embed.add_field(name="Schedule", value=_format_schedule(rdata, tz_name=tz_name), inline=True)
         embed.add_field(name="First fire", value=f"<t:{int(fire_dt.timestamp())}:F>", inline=True)
         embed.add_field(
