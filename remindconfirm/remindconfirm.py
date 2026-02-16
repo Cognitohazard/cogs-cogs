@@ -578,7 +578,10 @@ class RemindConfirm(commands.Cog):
     @commands.group(name="remindconfirm", aliases=["rc"], invoke_without_command=True)
     @commands.guild_only()
     async def rc(self, ctx: commands.Context):
-        """Manage recurring confirmation reminders."""
+        """Manage recurring confirmation reminders.
+
+        Use `[p]rc timezone` to set your server's timezone.
+        """
         await ctx.send_help(ctx.command)
 
     @rc.command(name="interval")
@@ -597,7 +600,8 @@ class RemindConfirm(commands.Cog):
         """Create an interval-based reminder.
 
         **Arguments:**
-        - `<first_fire>` — when to first fire: ISO datetime or relative (e.g. ``in 2h``)
+        - `<first_fire>` — when to first fire: ISO datetime or relative (e.g. ``in 2h``).
+          Absolute times are interpreted in the server's timezone.
         - `<schedule_interval>` — time between fires (e.g. ``3d``, ``1w``)
         - `<nag_interval>` — re-send frequency within each occurrence (e.g. ``1h``)
         - `<nag_expiry>` — max nag window per occurrence (e.g. ``24h``)
@@ -663,7 +667,8 @@ class RemindConfirm(commands.Cog):
 
         **Arguments:**
         - `<days>` — day names, comma-separated (e.g. ``tuesday``, ``mon,wed,fri``)
-        - `<time>` — time of day in 24h format (e.g. ``14:00``)
+        - `<time>` — time of day in 24h format (e.g. ``14:00``).
+          Interpreted in the server's timezone (see `[p]rc timezone`).
         - `<nag_interval>` — re-send frequency (e.g. ``1h``)
         - `<nag_expiry>` — max nag window (e.g. ``8h``)
         - `<message>` — the reminder text (use quotes)
@@ -728,6 +733,11 @@ class RemindConfirm(commands.Cog):
         """Create a one-shot reminder (no recurring nag).
 
         Stays active for 24h waiting for confirmation, then expires.
+
+        **Arguments:**
+        - `<when>`: ISO datetime (server timezone) or relative (e.g. `in 2h`).
+        - `<message>`: The reminder text.
+        - `<@users>`: Users who must confirm.
         """
         await self._create_once(ctx, when, None, "24h", message, users)
 
@@ -743,7 +753,15 @@ class RemindConfirm(commands.Cog):
         message: str,
         users: commands.Greedy[discord.Member],
     ):
-        """Create a one-shot reminder with a nag loop."""
+        """Create a one-shot reminder with a repeating nag loop.
+
+        **Arguments:**
+        - `<when>`: ISO datetime (server timezone) or relative (e.g. `in 2h`).
+        - `<nag_interval>`: How often to re-send (e.g. `1h`).
+        - `<nag_expiry>`: When to stop nagging (e.g. `24h`).
+        - `<message>`: Reminder text.
+        - `<@users>`: Required users.
+        """
         await self._create_once(ctx, when, nag_interval, nag_expiry, message, users)
 
     async def _create_once(
