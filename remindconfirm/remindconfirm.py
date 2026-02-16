@@ -7,7 +7,7 @@ import logging
 import re
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 
 import discord
 from redbot.core import Config, commands
@@ -30,6 +30,8 @@ DAY_NAMES = {
     "saturday": 5, "sat": 5,
     "sunday": 6, "sun": 6,
 }
+
+DAY_ABBREVS = {0: "Mon", 1: "Tue", 2: "Wed", 3: "Thu", 4: "Fri", 5: "Sat", 6: "Sun"}
 
 
 def parse_duration(text: str) -> Optional[timedelta]:
@@ -67,7 +69,7 @@ def parse_fire_time(text: str) -> Optional[datetime]:
 
 def parse_weekdays(text: str) -> Optional[List[int]]:
     """Parse comma-separated day names into weekday ints (0=Mon … 6=Sun)."""
-    days: list[int] = []
+    days: List[int] = []
     for part in text.lower().split(","):
         part = part.strip()
         if part not in DAY_NAMES:
@@ -78,7 +80,7 @@ def parse_weekdays(text: str) -> Optional[List[int]]:
     return sorted(days) if days else None
 
 
-def parse_time_of_day(text: str) -> Optional[tuple[int, int]]:
+def parse_time_of_day(text: str) -> Optional[tuple]:
     """Parse ``HH:MM`` into (hour, minute)."""
     m = re.match(r"^(\d{1,2}):(\d{2})$", text.strip())
     if not m:
@@ -92,7 +94,6 @@ def parse_time_of_day(text: str) -> Optional[tuple[int, int]]:
 def next_weekly_fire(weekdays: List[int], hour: int, minute: int) -> datetime:
     """Return the next datetime matching one of the given weekdays at HH:MM (UTC)."""
     now = datetime.now(timezone.utc)
-    # Check today through next 7 days
     for offset in range(8):
         candidate = now + timedelta(days=offset)
         if candidate.weekday() in weekdays:
@@ -101,6 +102,77 @@ def next_weekly_fire(weekdays: List[int], hour: int, minute: int) -> datetime:
                 return fire
     # Fallback (shouldn't happen with range(8))
     return now + timedelta(days=1)
+
+
+def _pending_users(rdata: dict) -> List[int]:
+    """Return user IDs from required_users that are not yet in confirmed_users."""
+    confirmed: Set[int] = set(rdata["confirmed_users"])
+    return [uid for uid in rdata["required_users"] if uid not in confirmed]
+
+
+def _all_confirmed(rdata: dict) -> bool:
+    """Check whether every required user has confirmed."""
+    return set(rdata["required_users"]).issubset(rdata["confirmed_users"])
+
+
+def _pending_mentions(rdata: dict) -> str:
+    """Return a comma-separated string of mentions for users who haven't confirmed."""
+    return ", ".join(f"<@{uid}>" for uid in _pending_users(rdata))
+
+
+def _confirmed_mentions(rdata: dict) -> str:
+    """Return a comma-separated string of mentions for users who have confirmed."""
+    return ", ".join(f"<@{uid}>" for uid in rdata["confirmed_users"])
+
+
+def _format_schedule(rdata: dict) -> str:
+    """Human-readable schedule string for display."""
+    if rdata["schedule_type"] == "interval":
+        return f"Every `{rdata['schedule_interval']}`"
+    elif rdata["schedule_type"] == "weekly":
+        days_display = ", ".join(DAY_ABBREVS[d] for d in rdata.get("weekdays", []))
+        return f"**{days_display}** at **{rdata.get('fire_time', '??')}** UTC"
+    return "Unknown"
+
+
+# ── Reminder data factory ───────────────────────────────────────────────
+
+
+def _make_reminder(
+    *,
+    rid: str,
+    channel_id: int,
+    message: str,
+    schedule_type: str,
+    nag_interval: str,
+    nag_expiry: str,
+    next_fire_at: datetime,
+    required_users: List[int],
+    creator_id: int,
+    schedule_interval: Optional[str] = None,
+    weekdays: Optional[List[int]] = None,
+    fire_time: Optional[str] = None,
+) -> dict:
+    """Create a canonical reminder dict with all required fields."""
+    return {
+        "reminder_id": rid,
+        "channel_id": channel_id,
+        "message": message,
+        "schedule_type": schedule_type,
+        "schedule_interval": schedule_interval,
+        "weekdays": weekdays,
+        "fire_time": fire_time,
+        "nag_interval": nag_interval,
+        "nag_expiry": nag_expiry,
+        "next_fire_at": next_fire_at.isoformat(),
+        "required_users": required_users,
+        "confirmed_users": [],
+        "current_message_id": None,
+        "occurrence_started_at": None,
+        "creator_id": creator_id,
+        "emoji": "✅",
+        "active": True,
+    }
 
 
 # ── Cog ─────────────────────────────────────────────────────────────────
@@ -116,6 +188,9 @@ class RemindConfirm(commands.Cog):
         self.config = Config.get_conf(self, identifier=298537412, force_registration=True)
         self.config.register_guild(**self.DEFAULT_GUILD)
         self._tasks: Dict[str, asyncio.Task] = {}
+        # In-memory index: message_id → (guild_id, reminder_id)
+        # Avoids scanning all reminders on every reaction event.
+        self._msg_index: Dict[int, tuple] = {}
 
     async def cog_load(self) -> None:
         """Re-schedule all active reminders on bot restart / cog load."""
@@ -124,20 +199,24 @@ class RemindConfirm(commands.Cog):
             for rid, rdata in guild_data.get("reminders", {}).items():
                 if rdata.get("active", False):
                     self._schedule_task(guild_id, rid, rdata)
+                    if rdata.get("current_message_id"):
+                        self._msg_index[rdata["current_message_id"]] = (guild_id, rid)
 
     async def cog_unload(self) -> None:
         """Cancel all running tasks on cog unload."""
         for task in self._tasks.values():
             task.cancel()
         self._tasks.clear()
+        self._msg_index.clear()
 
     # ── Helpers ──────────────────────────────────────────────────────────
 
     def _schedule_task(self, guild_id: int, reminder_id: str, rdata: dict) -> None:
         """Create and store an asyncio task for a reminder."""
         key = f"{guild_id}:{reminder_id}"
-        if key in self._tasks and not self._tasks[key].done():
-            self._tasks[key].cancel()
+        existing = self._tasks.get(key)
+        if existing is not None and not existing.done():
+            existing.cancel()
         self._tasks[key] = asyncio.create_task(
             self._reminder_loop(guild_id, reminder_id),
             name=f"remindconfirm-{key}",
@@ -153,13 +232,11 @@ class RemindConfirm(commands.Cog):
         async with self.config.guild_from_id(guild_id).reminders() as reminders:
             reminders[reminder_id] = data
 
-    def _build_embed(self, rdata: dict, guild: Optional[discord.Guild] = None) -> discord.Embed:
-        """Build the reminder status embed."""
-        required = rdata["required_users"]
-        confirmed = rdata["confirmed_users"]
-        pending = [uid for uid in required if uid not in confirmed]
-        total = len(required)
-        done = len(confirmed)
+    def _build_status_embed(self, rdata: dict) -> discord.Embed:
+        """Build the recurring nag embed showing confirmation progress."""
+        pending = _pending_users(rdata)
+        total = len(rdata["required_users"])
+        done = total - len(pending)
 
         embed = discord.Embed(
             title="⏰ Reminder",
@@ -168,10 +245,9 @@ class RemindConfirm(commands.Cog):
         )
 
         if pending:
-            pending_mentions = ", ".join(f"<@{uid}>" for uid in pending)
             embed.add_field(
-                name=f"{total - done}/{total} confirmations still needed",
-                value=f"Waiting on: {pending_mentions}",
+                name=f"{len(pending)}/{total} confirmations still needed",
+                value=f"Waiting on: {_pending_mentions(rdata)}",
                 inline=False,
             )
         else:
@@ -181,15 +257,63 @@ class RemindConfirm(commands.Cog):
                 inline=False,
             )
 
-        if confirmed:
-            confirmed_mentions = ", ".join(f"<@{uid}>" for uid in confirmed)
+        if rdata["confirmed_users"]:
             embed.add_field(
                 name="Confirmed",
-                value=confirmed_mentions,
+                value=_confirmed_mentions(rdata),
                 inline=False,
             )
 
         embed.set_footer(text=f"ID: {rdata['reminder_id']}  •  React {rdata['emoji']} to confirm")
+        return embed
+
+    def _build_completion_embed(self, rdata: dict) -> discord.Embed:
+        """Build the embed shown when all users have confirmed."""
+        embed = discord.Embed(
+            title="✅ Reminder — All confirmed!",
+            description=rdata["message"],
+            colour=discord.Colour.green(),
+        )
+        embed.add_field(name="Confirmed by", value=_confirmed_mentions(rdata), inline=False)
+        embed.set_footer(text=f"ID: {rdata['reminder_id']}")
+        return embed
+
+    def _build_expiry_embed(self, rdata: dict) -> discord.Embed:
+        """Build the embed shown when the nag window expires without full confirmation."""
+        embed = discord.Embed(
+            title="⏰ Reminder — nag window expired",
+            description=rdata["message"],
+            colour=discord.Colour.red(),
+        )
+        embed.add_field(
+            name="Still not confirmed by",
+            value=_pending_mentions(rdata),
+            inline=False,
+        )
+        embed.set_footer(text=f"ID: {rdata['reminder_id']}  •  Will fire again next cycle")
+        return embed
+
+    def _build_creation_embed(self, rdata: dict, fire_dt: datetime, users: list) -> discord.Embed:
+        """Build the embed shown when a reminder is first created."""
+        is_weekly = rdata["schedule_type"] == "weekly"
+        embed = discord.Embed(
+            title=f"📋 {'Weekly reminder' if is_weekly else 'Reminder'} created",
+            colour=discord.Colour.blurple(),
+        )
+        embed.add_field(name="ID", value=f"`{rdata['reminder_id']}`", inline=True)
+        embed.add_field(name="Message", value=rdata["message"], inline=False)
+        embed.add_field(name="Schedule", value=_format_schedule(rdata), inline=True)
+        embed.add_field(name="First fire", value=f"<t:{int(fire_dt.timestamp())}:F>", inline=True)
+        embed.add_field(
+            name="Nag",
+            value=f"Every `{rdata['nag_interval']}` for up to `{rdata['nag_expiry']}`",
+            inline=True,
+        )
+        embed.add_field(
+            name="Requires",
+            value=", ".join(u.mention for u in users),
+            inline=False,
+        )
         return embed
 
     # ── Core loop ────────────────────────────────────────────────────────
@@ -215,9 +339,9 @@ class RemindConfirm(commands.Cog):
                     break
 
                 # Run occurrence
-                await self._run_occurrence(guild_id, reminder_id, rdata)
+                await self._run_occurrence(guild_id, reminder_id)
 
-                # Re-fetch again, might have been cancelled during occurrence
+                # Re-fetch after occurrence (may have been cancelled)
                 rdata = await self._get_reminder(guild_id, reminder_id)
                 if rdata is None or not rdata.get("active", False):
                     break
@@ -225,7 +349,7 @@ class RemindConfirm(commands.Cog):
                 # Schedule next fire
                 next_fire = self._compute_next_fire(rdata)
                 rdata["next_fire_at"] = next_fire.isoformat()
-                rdata["confirmed_users"] = []  # reset for next occurrence
+                rdata["confirmed_users"] = []
                 rdata["current_message_id"] = None
                 rdata["occurrence_started_at"] = None
                 await self._save_reminder(guild_id, reminder_id, rdata)
@@ -235,8 +359,12 @@ class RemindConfirm(commands.Cog):
         except Exception:
             log.exception("Error in reminder loop for %s in guild %s", reminder_id, guild_id)
 
-    async def _run_occurrence(self, guild_id: int, reminder_id: str, rdata: dict) -> None:
+    async def _run_occurrence(self, guild_id: int, reminder_id: str) -> None:
         """Nag loop for a single occurrence. Stops on all-confirmed or expiry."""
+        rdata = await self._get_reminder(guild_id, reminder_id)
+        if rdata is None or not rdata.get("active", False):
+            return
+
         guild = self.bot.get_guild(guild_id)
         if guild is None:
             return
@@ -255,83 +383,65 @@ class RemindConfirm(commands.Cog):
         rdata["confirmed_users"] = []
         await self._save_reminder(guild_id, reminder_id, rdata)
 
+        first_iteration = True
         while True:
+            # On first iteration we send immediately; on subsequent ones we sleep first
+            if not first_iteration:
+                remaining_expiry = nag_expiry - (datetime.now(timezone.utc) - occurrence_start)
+                sleep_time = min(nag_interval, remaining_expiry)
+                sleep_secs = max(sleep_time.total_seconds(), 0)
+                if sleep_secs > 0:
+                    await asyncio.sleep(sleep_secs)
+            first_iteration = False
+
+            # Re-fetch state (reactions may have updated confirmed_users)
             rdata = await self._get_reminder(guild_id, reminder_id)
             if rdata is None or not rdata.get("active", False):
+                return
+
+            # Check all confirmed
+            if _all_confirmed(rdata):
+                await self._try_send(channel, embed=self._build_completion_embed(rdata))
                 return
 
             # Check nag expiry
             elapsed = datetime.now(timezone.utc) - occurrence_start
             if elapsed >= nag_expiry:
-                # Expiry — send notice
-                pending = [uid for uid in rdata["required_users"] if uid not in rdata["confirmed_users"]]
-                if pending:
-                    pending_mentions = ", ".join(f"<@{uid}>" for uid in pending)
-                    embed = discord.Embed(
-                        title="⏰ Reminder — nag window expired",
-                        description=rdata["message"],
-                        colour=discord.Colour.red(),
-                    )
-                    embed.add_field(
-                        name="Still not confirmed by",
-                        value=pending_mentions,
-                        inline=False,
-                    )
-                    embed.set_footer(text=f"ID: {rdata['reminder_id']}  •  Will fire again next cycle")
-                    try:
-                        await channel.send(embed=embed)
-                    except discord.HTTPException:
-                        pass
+                if _pending_users(rdata):
+                    await self._try_send(channel, embed=self._build_expiry_embed(rdata))
                 return
 
-            # Check all confirmed
-            if set(rdata["required_users"]).issubset(set(rdata["confirmed_users"])):
-                # All done!
-                embed = discord.Embed(
-                    title="✅ Reminder — All confirmed!",
-                    description=rdata["message"],
-                    colour=discord.Colour.green(),
-                )
-                confirmed_mentions = ", ".join(f"<@{uid}>" for uid in rdata["confirmed_users"])
-                embed.add_field(name="Confirmed by", value=confirmed_mentions, inline=False)
-                embed.set_footer(text=f"ID: {rdata['reminder_id']}")
+            # Delete old message and remove from index
+            old_msg_id = rdata.get("current_message_id")
+            if old_msg_id:
+                self._msg_index.pop(old_msg_id, None)
                 try:
-                    await channel.send(embed=embed)
-                except discord.HTTPException:
-                    pass
-                return
-
-            # Delete old message
-            if rdata.get("current_message_id"):
-                try:
-                    old_msg = await channel.fetch_message(rdata["current_message_id"])
+                    old_msg = await channel.fetch_message(old_msg_id)
                     await old_msg.delete()
                 except (discord.NotFound, discord.HTTPException):
                     pass
 
-            # Send new reminder message
-            embed = self._build_embed(rdata, guild)
+            # Send new reminder message (ping only pending users)
+            embed = self._build_status_embed(rdata)
+            content = " ".join(f"<@{uid}>" for uid in _pending_users(rdata))
             try:
-                new_msg = await channel.send(
-                    content=" ".join(f"<@{uid}>" for uid in rdata["required_users"]
-                                     if uid not in rdata["confirmed_users"]),
-                    embed=embed,
-                )
+                new_msg = await channel.send(content=content, embed=embed)
                 await new_msg.add_reaction(rdata["emoji"])
             except discord.HTTPException:
                 log.exception("Failed to send reminder message for %s", reminder_id)
                 return
 
-            # Update state
+            # Update state and index
             rdata["current_message_id"] = new_msg.id
+            self._msg_index[new_msg.id] = (guild_id, reminder_id)
             await self._save_reminder(guild_id, reminder_id, rdata)
 
-            # Sleep until next nag (or remaining expiry, whichever is shorter)
-            remaining_expiry = nag_expiry - (datetime.now(timezone.utc) - occurrence_start)
-            sleep_time = min(nag_interval, remaining_expiry)
-            sleep_secs = max(sleep_time.total_seconds(), 0)
-            if sleep_secs > 0:
-                await asyncio.sleep(sleep_secs)
+    async def _try_send(self, channel: discord.abc.Messageable, **kwargs) -> None:
+        """Send a message, swallowing HTTPExceptions."""
+        try:
+            await channel.send(**kwargs)
+        except discord.HTTPException:
+            pass
 
     def _compute_next_fire(self, rdata: dict) -> datetime:
         """Compute the next fire time based on schedule type."""
@@ -364,51 +474,44 @@ class RemindConfirm(commands.Cog):
         if payload.user_id == self.bot.user.id:
             return
 
-        reminders = await self.config.guild_from_id(payload.guild_id).reminders()
-        for rid, rdata in reminders.items():
-            if not rdata.get("active", False):
-                continue
-            if rdata.get("current_message_id") != payload.message_id:
-                continue
+        # O(1) lookup instead of scanning all reminders
+        lookup = self._msg_index.get(payload.message_id)
+        if lookup is None:
+            return
+        guild_id, rid = lookup
 
-            # Check emoji matches
-            expected = rdata.get("emoji", "✅")
-            if str(payload.emoji) != expected:
-                continue
+        rdata = await self._get_reminder(guild_id, rid)
+        if rdata is None or not rdata.get("active", False):
+            return
 
-            # Check user is in required list
-            if payload.user_id not in rdata["required_users"]:
-                continue
+        # Validate emoji
+        if str(payload.emoji) != rdata.get("emoji", "✅"):
+            return
 
-            # Already confirmed?
-            if payload.user_id in rdata["confirmed_users"]:
-                continue
+        # Validate user
+        if payload.user_id not in rdata["required_users"]:
+            return
+        if payload.user_id in rdata["confirmed_users"]:
+            return
 
-            # Add confirmation
-            rdata["confirmed_users"].append(payload.user_id)
-            await self._save_reminder(payload.guild_id, rid, rdata)
+        # Record confirmation
+        rdata["confirmed_users"].append(payload.user_id)
+        await self._save_reminder(guild_id, rid, rdata)
 
-            # Update the embed in-place
-            guild = self.bot.get_guild(payload.guild_id)
-            if guild is None:
-                return
-            channel = guild.get_channel(rdata["channel_id"])
-            if channel is None:
-                return
+        # Update embed in-place
+        guild = self.bot.get_guild(guild_id)
+        channel = guild.get_channel(rdata["channel_id"]) if guild else None
+        if channel is None:
+            return
 
-            try:
-                msg = await channel.fetch_message(payload.message_id)
-                embed = self._build_embed(rdata, guild)
-                await msg.edit(embed=embed)
-            except discord.HTTPException:
-                pass
+        try:
+            msg = await channel.fetch_message(payload.message_id)
+            await msg.edit(embed=self._build_status_embed(rdata))
+        except discord.HTTPException:
+            pass
 
-            # If all confirmed, cancel the nag loop early
-            # (the _run_occurrence loop will detect this on next iteration)
-            if set(rdata["required_users"]).issubset(set(rdata["confirmed_users"])):
-                log.info("All users confirmed for reminder %s — occurrence complete", rid)
-
-            return  # Only one reminder can match a message
+        if _all_confirmed(rdata):
+            log.info("All users confirmed for reminder %s — occurrence complete", rid)
 
     # ── Commands ─────────────────────────────────────────────────────────
 
@@ -456,41 +559,22 @@ class RemindConfirm(commands.Cog):
             return await ctx.send("❌ Invalid nag expiry. Examples: `8h`, `24h`, `2d`.")
 
         rid = uuid.uuid4().hex[:8]
-        rdata = {
-            "reminder_id": rid,
-            "channel_id": ctx.channel.id,
-            "message": message,
-            "schedule_type": "interval",
-            "schedule_interval": schedule_interval,
-            "weekdays": None,
-            "fire_time": None,
-            "nag_interval": nag_interval,
-            "nag_expiry": nag_expiry,
-            "next_fire_at": fire_dt.isoformat(),
-            "required_users": [u.id for u in users],
-            "confirmed_users": [],
-            "current_message_id": None,
-            "occurrence_started_at": None,
-            "creator_id": ctx.author.id,
-            "emoji": "✅",
-            "active": True,
-        }
+        rdata = _make_reminder(
+            rid=rid,
+            channel_id=ctx.channel.id,
+            message=message,
+            schedule_type="interval",
+            schedule_interval=schedule_interval,
+            nag_interval=nag_interval,
+            nag_expiry=nag_expiry,
+            next_fire_at=fire_dt,
+            required_users=[u.id for u in users],
+            creator_id=ctx.author.id,
+        )
 
         await self._save_reminder(ctx.guild.id, rid, rdata)
         self._schedule_task(ctx.guild.id, rid, rdata)
-
-        user_mentions = ", ".join(u.mention for u in users)
-        embed = discord.Embed(
-            title="📋 Reminder created",
-            colour=discord.Colour.blurple(),
-        )
-        embed.add_field(name="ID", value=f"`{rid}`", inline=True)
-        embed.add_field(name="Message", value=message, inline=False)
-        embed.add_field(name="First fire", value=f"<t:{int(fire_dt.timestamp())}:F>", inline=True)
-        embed.add_field(name="Schedule", value=f"Every `{schedule_interval}`", inline=True)
-        embed.add_field(name="Nag", value=f"Every `{nag_interval}` for up to `{nag_expiry}`", inline=True)
-        embed.add_field(name="Requires", value=user_mentions, inline=False)
-        await ctx.send(embed=embed)
+        await ctx.send(embed=self._build_creation_embed(rdata, fire_dt, users))
 
     @rc.command(name="weekly")
     @commands.guild_only()
@@ -534,45 +618,24 @@ class RemindConfirm(commands.Cog):
         hour, minute = parsed_time
         fire_dt = next_weekly_fire(weekdays, hour, minute)
 
-        day_names_map = {0: "Mon", 1: "Tue", 2: "Wed", 3: "Thu", 4: "Fri", 5: "Sat", 6: "Sun"}
-        day_display = ", ".join(day_names_map[d] for d in weekdays)
-
         rid = uuid.uuid4().hex[:8]
-        rdata = {
-            "reminder_id": rid,
-            "channel_id": ctx.channel.id,
-            "message": message,
-            "schedule_type": "weekly",
-            "schedule_interval": None,
-            "weekdays": weekdays,
-            "fire_time": time,
-            "nag_interval": nag_interval,
-            "nag_expiry": nag_expiry,
-            "next_fire_at": fire_dt.isoformat(),
-            "required_users": [u.id for u in users],
-            "confirmed_users": [],
-            "current_message_id": None,
-            "occurrence_started_at": None,
-            "creator_id": ctx.author.id,
-            "emoji": "✅",
-            "active": True,
-        }
+        rdata = _make_reminder(
+            rid=rid,
+            channel_id=ctx.channel.id,
+            message=message,
+            schedule_type="weekly",
+            weekdays=weekdays,
+            fire_time=time,
+            nag_interval=nag_interval,
+            nag_expiry=nag_expiry,
+            next_fire_at=fire_dt,
+            required_users=[u.id for u in users],
+            creator_id=ctx.author.id,
+        )
 
         await self._save_reminder(ctx.guild.id, rid, rdata)
         self._schedule_task(ctx.guild.id, rid, rdata)
-
-        user_mentions = ", ".join(u.mention for u in users)
-        embed = discord.Embed(
-            title="📋 Weekly reminder created",
-            colour=discord.Colour.blurple(),
-        )
-        embed.add_field(name="ID", value=f"`{rid}`", inline=True)
-        embed.add_field(name="Message", value=message, inline=False)
-        embed.add_field(name="Schedule", value=f"Every **{day_display}** at **{time}** UTC", inline=True)
-        embed.add_field(name="First fire", value=f"<t:{int(fire_dt.timestamp())}:F>", inline=True)
-        embed.add_field(name="Nag", value=f"Every `{nag_interval}` for up to `{nag_expiry}`", inline=True)
-        embed.add_field(name="Requires", value=user_mentions, inline=False)
-        await ctx.send(embed=embed)
+        await ctx.send(embed=self._build_creation_embed(rdata, fire_dt, users))
 
     @rc.command(name="list")
     @commands.guild_only()
@@ -586,16 +649,7 @@ class RemindConfirm(commands.Cog):
 
         embed = discord.Embed(title="📋 Active reminders", colour=discord.Colour.blurple())
         for rid, r in active.items():
-            schedule_info = ""
-            if r["schedule_type"] == "interval":
-                schedule_info = f"Every `{r['schedule_interval']}`"
-            elif r["schedule_type"] == "weekly":
-                day_names_map = {0: "Mon", 1: "Tue", 2: "Wed", 3: "Thu", 4: "Fri", 5: "Sat", 6: "Sun"}
-                days_display = ", ".join(day_names_map[d] for d in r.get("weekdays", []))
-                schedule_info = f"**{days_display}** at **{r.get('fire_time', '??')}** UTC"
-
-            pending = [uid for uid in r["required_users"] if uid not in r["confirmed_users"]]
-            confirmed_count = len(r["confirmed_users"])
+            pending = _pending_users(r)
             total = len(r["required_users"])
 
             next_fire = r.get("next_fire_at", "unknown")
@@ -607,18 +661,14 @@ class RemindConfirm(commands.Cog):
 
             value_lines = [
                 f"**Message:** {r['message']}",
-                f"**Schedule:** {schedule_info}",
+                f"**Schedule:** {_format_schedule(r)}",
                 f"**Next fire:** {next_fire_display}",
-                f"**Confirmations:** {confirmed_count}/{total}",
+                f"**Confirmations:** {total - len(pending)}/{total}",
             ]
             if pending:
-                value_lines.append(f"**Waiting on:** {', '.join(f'<@{uid}>' for uid in pending)}")
+                value_lines.append(f"**Waiting on:** {_pending_mentions(r)}")
 
-            embed.add_field(
-                name=f"`{rid}`",
-                value="\n".join(value_lines),
-                inline=False,
-            )
+            embed.add_field(name=f"`{rid}`", value="\n".join(value_lines), inline=False)
 
         await ctx.send(embed=embed)
 
@@ -634,17 +684,20 @@ class RemindConfirm(commands.Cog):
         rdata["active"] = False
         await self._save_reminder(ctx.guild.id, reminder_id, rdata)
 
+        # Cancel background task
         key = f"{ctx.guild.id}:{reminder_id}"
-        if key in self._tasks:
-            self._tasks[key].cancel()
-            del self._tasks[key]
+        task = self._tasks.pop(key, None)
+        if task is not None:
+            task.cancel()
 
-        # Try to delete current message
-        if rdata.get("current_message_id"):
+        # Clean up message index and delete current message
+        old_msg_id = rdata.get("current_message_id")
+        if old_msg_id:
+            self._msg_index.pop(old_msg_id, None)
             channel = ctx.guild.get_channel(rdata["channel_id"])
             if channel:
                 try:
-                    msg = await channel.fetch_message(rdata["current_message_id"])
+                    msg = await channel.fetch_message(old_msg_id)
                     await msg.delete()
                 except (discord.NotFound, discord.HTTPException):
                     pass
