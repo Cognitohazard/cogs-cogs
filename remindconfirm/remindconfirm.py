@@ -834,17 +834,22 @@ class RemindConfirm(commands.Cog):
             pending = _pending_users(r)
             total = len(r["required_users"])
 
-            next_fire = r.get("next_fire_at", "unknown")
-            try:
-                ts = int(datetime.fromisoformat(next_fire).timestamp())
-                next_fire_display = f"<t:{ts}:R>"
-            except (ValueError, TypeError):
-                next_fire_display = next_fire
+            if r.get("occurrence_started_at"):
+                start_ts = int(datetime.fromisoformat(r["occurrence_started_at"]).timestamp())
+                next_fire_line = f"**Status:** Occurring now (started <t:{start_ts}:R>)"
+            else:
+                next_fire = r.get("next_fire_at", "unknown")
+                try:
+                    ts = int(datetime.fromisoformat(next_fire).timestamp())
+                    next_fire_display = f"<t:{ts}:R>"
+                except (ValueError, TypeError):
+                    next_fire_display = next_fire
+                next_fire_line = f"**Next fire:** {next_fire_display}"
 
             value_lines = [
                 f"**Message:** {r['message']}",
                 f"**Schedule:** {_format_schedule(r, tz_name=tz_name)}",
-                f"**Next fire:** {next_fire_display}",
+                next_fire_line,
                 f"**Confirmations:** {total - len(pending)}/{total}",
             ]
             if pending:
