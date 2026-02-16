@@ -630,6 +630,8 @@ class RemindConfirm(commands.Cog):
             return await ctx.send("❌ Nag expiry must be ≥ nag interval.")
 
         if not users:
+            if message.startswith("<@") and message.endswith(">"):
+                return await ctx.send("❌ It looks like you forgot the message argument! (The user mention was consumed as the message)")
             return await ctx.send("❌ You must mention at least one user to confirm.")
 
         rid = uuid.uuid4().hex[:8]
@@ -690,6 +692,8 @@ class RemindConfirm(commands.Cog):
             return await ctx.send("❌ Nag expiry must be ≥ nag interval.")
 
         if not users:
+            if message.startswith("<@") and message.endswith(">"):
+                return await ctx.send("❌ It looks like you forgot the message argument! (The user mention was consumed as the message)")
             return await ctx.send("❌ You must mention at least one user to confirm.")
 
         tz_name = await self.config.guild(ctx.guild).timezone()
@@ -793,6 +797,8 @@ class RemindConfirm(commands.Cog):
             return await ctx.send("❌ Nag expiry must be ≥ nag interval.")
 
         if not users:
+            if message.startswith("<@") and message.endswith(">"):
+                return await ctx.send("❌ It looks like you forgot the message argument! (The user mention was consumed as the message)")
             return await ctx.send("❌ You must mention at least one user to confirm.")
 
         rid = uuid.uuid4().hex[:8]
