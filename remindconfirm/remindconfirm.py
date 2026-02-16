@@ -566,9 +566,6 @@ class RemindConfirm(commands.Cog):
         - `<message>` — the reminder text (use quotes)
         - `<@users>` — users who must confirm
         """
-        if not users:
-            return await ctx.send("❌ You must mention at least one user to confirm.")
-
         fire_dt = parse_fire_time(first_fire)
         if fire_dt is None:
             return await ctx.send('❌ Invalid first fire time. Use ISO format or `in 2h`.')
@@ -583,6 +580,9 @@ class RemindConfirm(commands.Cog):
             return await ctx.send("❌ Invalid nag expiry. Examples: `8h`, `24h`, `2d`.")
         if parse_duration(nag_expiry) < parse_duration(nag_interval):
             return await ctx.send("❌ Nag expiry must be ≥ nag interval.")
+
+        if not users:
+            return await ctx.send("❌ You must mention at least one user to confirm.")
 
         rid = uuid.uuid4().hex[:8]
         rdata = _make_reminder(
@@ -625,9 +625,6 @@ class RemindConfirm(commands.Cog):
         - `<message>` — the reminder text (use quotes)
         - `<@users>` — users who must confirm
         """
-        if not users:
-            return await ctx.send("❌ You must mention at least one user to confirm.")
-
         weekdays = parse_weekdays(days)
         if weekdays is None:
             return await ctx.send("❌ Invalid days. Examples: `tuesday`, `mon,wed,fri`.")
@@ -642,6 +639,9 @@ class RemindConfirm(commands.Cog):
             return await ctx.send("❌ Invalid nag expiry. Examples: `8h`, `24h`, `2d`.")
         if parse_duration(nag_expiry) < parse_duration(nag_interval):
             return await ctx.send("❌ Nag expiry must be ≥ nag interval.")
+
+        if not users:
+            return await ctx.send("❌ You must mention at least one user to confirm.")
 
         hour, minute = parsed_time
         fire_dt = next_weekly_fire(weekdays, hour, minute)
