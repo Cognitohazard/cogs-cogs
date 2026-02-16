@@ -20,8 +20,6 @@ log = logging.getLogger("red.remindconfirm")
 DURATION_RE = re.compile(
     r"^(?:(\d+)w)?(?:(\d+)d)?(?:(\d+)h)?(?:(\d+)m)?$", re.IGNORECASE
 )
-# Reject strings with trailing bare digits (e.g. "2h30" missing a unit)
-BAD_TRAILING_DIGITS_RE = re.compile(r"\d$")  # last char is a digit without a unit letter
 
 DAY_NAMES = {
     "monday": 0, "mon": 0,
@@ -41,9 +39,6 @@ def parse_duration(text: str) -> Optional[timedelta]:
     text = text.strip()
     m = DURATION_RE.match(text)
     if not m:
-        return None
-    # Reject strings like "2h30" where a number has no unit suffix
-    if text and text[-1].isdigit() and any(c.isalpha() for c in text):
         return None
     weeks = int(m.group(1) or 0)
     days = int(m.group(2) or 0)
@@ -413,12 +408,14 @@ class RemindConfirm(commands.Cog):
 
             # Check all confirmed
             if _all_confirmed(rdata):
+                self._msg_index.pop(rdata.get("current_message_id"), None)
                 await self._try_send(channel, embed=self._build_completion_embed(rdata))
                 return
 
             # Check nag expiry
             elapsed = datetime.now(timezone.utc) - occurrence_start
             if elapsed >= nag_expiry:
+                self._msg_index.pop(rdata.get("current_message_id"), None)
                 if _pending_users(rdata):
                     await self._try_send(channel, embed=self._build_expiry_embed(rdata))
                 return
@@ -519,19 +516,23 @@ class RemindConfirm(commands.Cog):
 
             # Record confirmation (persisted when context manager exits)
             rdata["confirmed_users"].append(payload.user_id)
+            # Snapshot state for embed update (avoids stale data after lock release)
+            rdata_snapshot = dict(rdata)
+            rdata_snapshot["confirmed_users"] = list(rdata["confirmed_users"])
+            rdata_snapshot["required_users"] = list(rdata["required_users"])
 
         # Update embed in-place (outside the lock to avoid holding it during I/O)
-        channel = guild.get_channel(rdata["channel_id"])
+        channel = guild.get_channel(rdata_snapshot["channel_id"])
         if channel is None:
             return
 
         try:
             msg = await channel.fetch_message(payload.message_id)
-            await msg.edit(embed=self._build_status_embed(rdata))
+            await msg.edit(embed=self._build_status_embed(rdata_snapshot))
         except discord.HTTPException:
             pass
 
-        if _all_confirmed(rdata):
+        if _all_confirmed(rdata_snapshot):
             log.info("All users confirmed for reminder %s — occurrence complete", rid)
 
     # ── Commands ─────────────────────────────────────────────────────────
@@ -571,6 +572,8 @@ class RemindConfirm(commands.Cog):
         fire_dt = parse_fire_time(first_fire)
         if fire_dt is None:
             return await ctx.send('❌ Invalid first fire time. Use ISO format or `in 2h`.')
+        if fire_dt < datetime.now(timezone.utc):
+            return await ctx.send('❌ First fire time is in the past.')
 
         if parse_duration(schedule_interval) is None:
             return await ctx.send("❌ Invalid schedule interval. Examples: `30m`, `2h`, `3d`, `1w`.")
@@ -578,6 +581,8 @@ class RemindConfirm(commands.Cog):
             return await ctx.send("❌ Invalid nag interval. Examples: `30m`, `1h`.")
         if parse_duration(nag_expiry) is None:
             return await ctx.send("❌ Invalid nag expiry. Examples: `8h`, `24h`, `2d`.")
+        if parse_duration(nag_expiry) < parse_duration(nag_interval):
+            return await ctx.send("❌ Nag expiry must be ≥ nag interval.")
 
         rid = uuid.uuid4().hex[:8]
         rdata = _make_reminder(
@@ -635,6 +640,8 @@ class RemindConfirm(commands.Cog):
             return await ctx.send("❌ Invalid nag interval. Examples: `30m`, `1h`.")
         if parse_duration(nag_expiry) is None:
             return await ctx.send("❌ Invalid nag expiry. Examples: `8h`, `24h`, `2d`.")
+        if parse_duration(nag_expiry) < parse_duration(nag_interval):
+            return await ctx.send("❌ Nag expiry must be ≥ nag interval.")
 
         hour, minute = parsed_time
         fire_dt = next_weekly_fire(weekdays, hour, minute)
