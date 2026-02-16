@@ -8,6 +8,7 @@ import re
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Set
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import discord
 from redbot.core import Config, commands
@@ -49,20 +50,25 @@ def parse_duration(text: str) -> Optional[timedelta]:
     return timedelta(weeks=weeks, days=days, hours=hours, minutes=minutes)
 
 
-def parse_fire_time(text: str) -> Optional[datetime]:
-    """Parse an absolute ISO-8601 datetime **or** a relative offset (``in 2h``)."""
+def parse_fire_time(text: str, tz: ZoneInfo | None = None) -> Optional[datetime]:
+    """Parse an absolute ISO-8601 datetime **or** a relative offset (``in 2h``).
+
+    Absolute times are interpreted in *tz* (default UTC) and converted to UTC.
+    Relative offsets are always relative to now (timezone-independent).
+    """
     text = text.strip()
+    tz = tz or timezone.utc
     # Relative: "in 2h", "in 30m", "in 1d"
     if text.lower().startswith("in "):
         delta = parse_duration(text[3:])
         if delta is None:
             return None
         return datetime.now(timezone.utc) + delta
-    # Absolute ISO
+    # Absolute ISO — interpret in the guild's timezone
     for fmt in ("%Y-%m-%dT%H:%M", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S"):
         try:
             dt = datetime.strptime(text, fmt)
-            return dt.replace(tzinfo=timezone.utc)
+            return dt.replace(tzinfo=tz).astimezone(timezone.utc)
         except ValueError:
             continue
     return None
@@ -92,22 +98,32 @@ def parse_time_of_day(text: str) -> Optional[tuple]:
     return None
 
 
-def next_weekly_fire(weekdays: List[int], hour: int, minute: int, *, not_before: Optional[datetime] = None) -> datetime:
-    """Return the next datetime matching one of the given weekdays at HH:MM (UTC).
+def next_weekly_fire(
+    weekdays: List[int],
+    hour: int,
+    minute: int,
+    *,
+    not_before: Optional[datetime] = None,
+    tz: ZoneInfo | None = None,
+) -> datetime:
+    """Return the next UTC datetime matching one of the given weekdays at HH:MM in *tz*.
 
     If *not_before* is given, the returned time will be strictly after it.
     This prevents re-firing on the same day after a long nag window.
     """
-    now = datetime.now(timezone.utc)
-    threshold = not_before if not_before is not None else now
+    tz = tz or timezone.utc
+    now_utc = datetime.now(timezone.utc)
+    now_local = now_utc.astimezone(tz)
+    threshold = not_before if not_before is not None else now_utc
     for offset in range(8):
-        candidate = now + timedelta(days=offset)
+        candidate = now_local + timedelta(days=offset)
         if candidate.weekday() in weekdays:
-            fire = candidate.replace(hour=hour, minute=minute, second=0, microsecond=0)
-            if fire > threshold:
-                return fire
+            fire_local = candidate.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            fire_utc = fire_local.astimezone(timezone.utc)
+            if fire_utc > threshold:
+                return fire_utc
     # Fallback (shouldn't happen with range(8))
-    return now + timedelta(days=1)
+    return now_utc + timedelta(days=1)
 
 
 def _pending_users(rdata: dict) -> List[int]:
@@ -131,13 +147,13 @@ def _confirmed_mentions(rdata: dict) -> str:
     return ", ".join(f"<@{uid}>" for uid in rdata["confirmed_users"])
 
 
-def _format_schedule(rdata: dict) -> str:
+def _format_schedule(rdata: dict, tz_name: str = "UTC") -> str:
     """Human-readable schedule string for display."""
     if rdata["schedule_type"] == "interval":
         return f"Every `{rdata['schedule_interval']}`"
     elif rdata["schedule_type"] == "weekly":
         days_display = ", ".join(DAY_ABBREVS[d] for d in rdata.get("weekdays", []))
-        return f"**{days_display}** at **{rdata.get('fire_time', '??')}** UTC"
+        return f"**{days_display}** at **{rdata.get('fire_time', '??')}** {tz_name}"
     return "Unknown"
 
 
@@ -187,7 +203,7 @@ def _make_reminder(
 class RemindConfirm(commands.Cog):
     """Recurring reminders that require reaction confirmations from specified users."""
 
-    DEFAULT_GUILD = {"reminders": {}}
+    DEFAULT_GUILD = {"reminders": {}, "timezone": "America/New_York"}
 
     def __init__(self, bot: Red):
         self.bot = bot
@@ -299,7 +315,7 @@ class RemindConfirm(commands.Cog):
         embed.set_footer(text=f"ID: {rdata['reminder_id']}  •  Will fire again next cycle")
         return embed
 
-    def _build_creation_embed(self, rdata: dict, fire_dt: datetime, users: list) -> discord.Embed:
+    def _build_creation_embed(self, rdata: dict, fire_dt: datetime, users: list, tz_name: str = "UTC") -> discord.Embed:
         """Build the embed shown when a reminder is first created."""
         is_weekly = rdata["schedule_type"] == "weekly"
         embed = discord.Embed(
@@ -308,7 +324,7 @@ class RemindConfirm(commands.Cog):
         )
         embed.add_field(name="ID", value=f"`{rdata['reminder_id']}`", inline=True)
         embed.add_field(name="Message", value=rdata["message"], inline=False)
-        embed.add_field(name="Schedule", value=_format_schedule(rdata), inline=True)
+        embed.add_field(name="Schedule", value=_format_schedule(rdata, tz_name=tz_name), inline=True)
         embed.add_field(name="First fire", value=f"<t:{int(fire_dt.timestamp())}:F>", inline=True)
         embed.add_field(
             name="Nag",
@@ -353,7 +369,12 @@ class RemindConfirm(commands.Cog):
                     break
 
                 # Schedule next fire
-                next_fire = self._compute_next_fire(rdata)
+                tz_name = await self.config.guild_from_id(guild_id).timezone()
+                try:
+                    tz = ZoneInfo(tz_name)
+                except (ZoneInfoNotFoundError, KeyError):
+                    tz = None
+                next_fire = self._compute_next_fire(rdata, tz=tz)
                 rdata["next_fire_at"] = next_fire.isoformat()
                 rdata["confirmed_users"] = []
                 rdata["current_message_id"] = None
@@ -454,7 +475,7 @@ class RemindConfirm(commands.Cog):
         except discord.HTTPException:
             pass
 
-    def _compute_next_fire(self, rdata: dict) -> datetime:
+    def _compute_next_fire(self, rdata: dict, tz: ZoneInfo | None = None) -> datetime:
         """Compute the next fire time based on schedule type."""
         now = datetime.now(timezone.utc)
 
@@ -473,7 +494,7 @@ class RemindConfirm(commands.Cog):
             hour, minute = parsed
             # Use not_before=now to prevent re-firing on the same day
             # after a long nag window that spans past the fire time
-            return next_weekly_fire(weekdays, hour, minute, not_before=now)
+            return next_weekly_fire(weekdays, hour, minute, not_before=now, tz=tz)
 
         return now + timedelta(hours=1)  # fallback
 
@@ -566,7 +587,13 @@ class RemindConfirm(commands.Cog):
         - `<message>` — the reminder text (use quotes)
         - `<@users>` — users who must confirm
         """
-        fire_dt = parse_fire_time(first_fire)
+        tz_name = await self.config.guild(ctx.guild).timezone()
+        try:
+            tz = ZoneInfo(tz_name)
+        except (ZoneInfoNotFoundError, KeyError):
+            tz = None
+
+        fire_dt = parse_fire_time(first_fire, tz=tz)
         if fire_dt is None:
             return await ctx.send('❌ Invalid first fire time. Use ISO format or `in 2h`.')
         if fire_dt < datetime.now(timezone.utc):
@@ -600,7 +627,7 @@ class RemindConfirm(commands.Cog):
 
         await self._save_reminder(ctx.guild.id, rid, rdata)
         self._schedule_task(ctx.guild.id, rid, rdata)
-        await ctx.send(embed=self._build_creation_embed(rdata, fire_dt, users))
+        await ctx.send(embed=self._build_creation_embed(rdata, fire_dt, users, tz_name=tz_name))
 
     @rc.command(name="weekly")
     @commands.guild_only()
@@ -643,8 +670,14 @@ class RemindConfirm(commands.Cog):
         if not users:
             return await ctx.send("❌ You must mention at least one user to confirm.")
 
+        tz_name = await self.config.guild(ctx.guild).timezone()
+        try:
+            tz = ZoneInfo(tz_name)
+        except (ZoneInfoNotFoundError, KeyError):
+            tz = None
+
         hour, minute = parsed_time
-        fire_dt = next_weekly_fire(weekdays, hour, minute)
+        fire_dt = next_weekly_fire(weekdays, hour, minute, tz=tz)
 
         rid = uuid.uuid4().hex[:8]
         rdata = _make_reminder(
@@ -663,7 +696,7 @@ class RemindConfirm(commands.Cog):
 
         await self._save_reminder(ctx.guild.id, rid, rdata)
         self._schedule_task(ctx.guild.id, rid, rdata)
-        await ctx.send(embed=self._build_creation_embed(rdata, fire_dt, users))
+        await ctx.send(embed=self._build_creation_embed(rdata, fire_dt, users, tz_name=tz_name))
 
     @rc.command(name="list")
     @commands.guild_only()
@@ -675,6 +708,7 @@ class RemindConfirm(commands.Cog):
         if not active:
             return await ctx.send("No active reminders.")
 
+        tz_name = await self.config.guild(ctx.guild).timezone()
         embed = discord.Embed(title="📋 Active reminders", colour=discord.Colour.blurple())
         for rid, r in active.items():
             pending = _pending_users(r)
@@ -689,7 +723,7 @@ class RemindConfirm(commands.Cog):
 
             value_lines = [
                 f"**Message:** {r['message']}",
-                f"**Schedule:** {_format_schedule(r)}",
+                f"**Schedule:** {_format_schedule(r, tz_name=tz_name)}",
                 f"**Next fire:** {next_fire_display}",
                 f"**Confirmations:** {total - len(pending)}/{total}",
             ]
@@ -744,3 +778,28 @@ class RemindConfirm(commands.Cog):
         rdata["emoji"] = emoji
         await self._save_reminder(ctx.guild.id, reminder_id, rdata)
         await ctx.send(f"✅ Emoji for `{reminder_id}` changed to {emoji}.")
+
+    @rc.command(name="timezone", aliases=["tz"])
+    @commands.guild_only()
+    @commands.admin_or_permissions(manage_guild=True)
+    async def rc_timezone(self, ctx: commands.Context, tz_name: Optional[str] = None):
+        """View or set the server timezone for reminders.
+
+        **Examples:** `America/New_York`, `US/Pacific`, `Europe/London`, `UTC`
+
+        Run without arguments to see the current setting.
+        """
+        if tz_name is None:
+            current = await self.config.guild(ctx.guild).timezone()
+            return await ctx.send(f"🕐 Current timezone: **{current}**")
+
+        try:
+            ZoneInfo(tz_name)
+        except (ZoneInfoNotFoundError, KeyError):
+            return await ctx.send(
+                f"❌ Unknown timezone `{tz_name}`. "
+                "Use IANA names like `America/New_York`, `US/Pacific`, `Europe/London`, `UTC`."
+            )
+
+        await self.config.guild(ctx.guild).timezone.set(tz_name)
+        await ctx.send(f"✅ Timezone set to **{tz_name}**.")
