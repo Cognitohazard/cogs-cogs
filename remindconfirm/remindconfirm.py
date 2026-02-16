@@ -20,6 +20,8 @@ log = logging.getLogger("red.remindconfirm")
 DURATION_RE = re.compile(
     r"^(?:(\d+)w)?(?:(\d+)d)?(?:(\d+)h)?(?:(\d+)m)?$", re.IGNORECASE
 )
+# Reject strings with trailing bare digits (e.g. "2h30" missing a unit)
+BAD_TRAILING_DIGITS_RE = re.compile(r"\d$")  # last char is a digit without a unit letter
 
 DAY_NAMES = {
     "monday": 0, "mon": 0,
@@ -36,8 +38,12 @@ DAY_ABBREVS = {0: "Mon", 1: "Tue", 2: "Wed", 3: "Thu", 4: "Fri", 5: "Sat", 6: "S
 
 def parse_duration(text: str) -> Optional[timedelta]:
     """Parse a duration string like ``2h30m``, ``1d``, ``1w`` into a timedelta."""
-    m = DURATION_RE.match(text.strip())
+    text = text.strip()
+    m = DURATION_RE.match(text)
     if not m:
+        return None
+    # Reject strings like "2h30" where a number has no unit suffix
+    if text and text[-1].isdigit() and any(c.isalpha() for c in text):
         return None
     weeks = int(m.group(1) or 0)
     days = int(m.group(2) or 0)
@@ -91,14 +97,19 @@ def parse_time_of_day(text: str) -> Optional[tuple]:
     return None
 
 
-def next_weekly_fire(weekdays: List[int], hour: int, minute: int) -> datetime:
-    """Return the next datetime matching one of the given weekdays at HH:MM (UTC)."""
+def next_weekly_fire(weekdays: List[int], hour: int, minute: int, *, not_before: Optional[datetime] = None) -> datetime:
+    """Return the next datetime matching one of the given weekdays at HH:MM (UTC).
+
+    If *not_before* is given, the returned time will be strictly after it.
+    This prevents re-firing on the same day after a long nag window.
+    """
     now = datetime.now(timezone.utc)
+    threshold = not_before if not_before is not None else now
     for offset in range(8):
         candidate = now + timedelta(days=offset)
         if candidate.weekday() in weekdays:
             fire = candidate.replace(hour=hour, minute=minute, second=0, microsecond=0)
-            if fire > now:
+            if fire > threshold:
                 return fire
     # Fallback (shouldn't happen with range(8))
     return now + timedelta(days=1)
@@ -379,9 +390,10 @@ class RemindConfirm(commands.Cog):
             return
 
         occurrence_start = datetime.now(timezone.utc)
-        rdata["occurrence_started_at"] = occurrence_start.isoformat()
-        rdata["confirmed_users"] = []
-        await self._save_reminder(guild_id, reminder_id, rdata)
+        async with self.config.guild_from_id(guild_id).reminders() as reminders:
+            rdata = reminders.get(reminder_id, rdata)
+            rdata["occurrence_started_at"] = occurrence_start.isoformat()
+            rdata["confirmed_users"] = []
 
         first_iteration = True
         while True:
@@ -431,10 +443,12 @@ class RemindConfirm(commands.Cog):
                 log.exception("Failed to send reminder message for %s", reminder_id)
                 return
 
-            # Update state and index
-            rdata["current_message_id"] = new_msg.id
+            # Update state and index atomically
             self._msg_index[new_msg.id] = (guild_id, reminder_id)
-            await self._save_reminder(guild_id, reminder_id, rdata)
+            async with self.config.guild_from_id(guild_id).reminders() as reminders:
+                r = reminders.get(reminder_id)
+                if r is not None:
+                    r["current_message_id"] = new_msg.id
 
     async def _try_send(self, channel: discord.abc.Messageable, **kwargs) -> None:
         """Send a message, swallowing HTTPExceptions."""
@@ -460,7 +474,9 @@ class RemindConfirm(commands.Cog):
             if parsed is None or not weekdays:
                 return now + timedelta(days=1)  # fallback
             hour, minute = parsed
-            return next_weekly_fire(weekdays, hour, minute)
+            # Use not_before=now to prevent re-firing on the same day
+            # after a long nag window that spans past the fire time
+            return next_weekly_fire(weekdays, hour, minute, not_before=now)
 
         return now + timedelta(hours=1)  # fallback
 
@@ -480,27 +496,32 @@ class RemindConfirm(commands.Cog):
             return
         guild_id, rid = lookup
 
-        rdata = await self._get_reminder(guild_id, rid)
-        if rdata is None or not rdata.get("active", False):
-            return
-
-        # Validate emoji
-        if str(payload.emoji) != rdata.get("emoji", "✅"):
-            return
-
-        # Validate user
-        if payload.user_id not in rdata["required_users"]:
-            return
-        if payload.user_id in rdata["confirmed_users"]:
-            return
-
-        # Record confirmation
-        rdata["confirmed_users"].append(payload.user_id)
-        await self._save_reminder(guild_id, rid, rdata)
-
-        # Update embed in-place
+        # Validate guild/channel exist before doing any work
         guild = self.bot.get_guild(guild_id)
-        channel = guild.get_channel(rdata["channel_id"]) if guild else None
+        if guild is None:
+            return
+
+        # Atomic read-modify-write to prevent lost confirmations
+        async with self.config.guild_from_id(guild_id).reminders() as reminders:
+            rdata = reminders.get(rid)
+            if rdata is None or not rdata.get("active", False):
+                return
+
+            # Validate emoji
+            if str(payload.emoji) != rdata.get("emoji", "✅"):
+                return
+
+            # Validate user
+            if payload.user_id not in rdata["required_users"]:
+                return
+            if payload.user_id in rdata["confirmed_users"]:
+                return
+
+            # Record confirmation (persisted when context manager exits)
+            rdata["confirmed_users"].append(payload.user_id)
+
+        # Update embed in-place (outside the lock to avoid holding it during I/O)
+        channel = guild.get_channel(rdata["channel_id"])
         if channel is None:
             return
 
