@@ -134,8 +134,12 @@ def _pending_users(rdata: dict) -> List[int]:
 
 def _all_confirmed(rdata: dict) -> bool:
     """Check whether sufficient users have confirmed."""
-    required = rdata.get("required_count", len(rdata["required_users"]))
-    return len(rdata["confirmed_users"]) >= required
+    required = rdata.get("required_count")
+    if required is None:
+        required = len(rdata["required_users"])
+    confirmed = len(rdata["confirmed_users"])
+    log.debug(f"Checking confirmed: {confirmed}/{required} (Requirements: {rdata.get('required_count')} / {len(rdata['required_users'])})")
+    return confirmed >= required
 
 
 def _pending_mentions(rdata: dict) -> str:
@@ -259,11 +263,13 @@ class RemindConfirm(commands.Cog):
         async with self.config.guild_from_id(guild_id).reminders() as reminders:
             reminders[reminder_id] = data
 
-    def _build_status_embed(self, rdata: dict) -> discord.Embed:
         """Build the recurring nag embed showing confirmation progress."""
         pending_users = _pending_users(rdata)
         
-        required_count = rdata.get("required_count", len(rdata["required_users"]))
+        required_count = rdata.get("required_count")
+        if required_count is None:
+            required_count = len(rdata["required_users"])
+            
         confirmed_count = len(rdata["confirmed_users"])
         needed_count = max(0, required_count - confirmed_count)
 
@@ -338,8 +344,16 @@ class RemindConfirm(commands.Cog):
             value=f"Every `{rdata['nag_interval']}` for up to `{rdata['nag_expiry']}`",
             inline=True,
         )
+    
+        required_count = rdata.get("required_count")
+        total_users = len(users)
+        if required_count and required_count < total_users:
+            req_name = f"Requires ({required_count} of {total_users} confirmations)"
+        else:
+            req_name = "Requires"
+
         embed.add_field(
-            name="Requires",
+            name=req_name,
             value=", ".join(u.mention for u in users),
             inline=False,
         )
@@ -468,12 +482,15 @@ class RemindConfirm(commands.Cog):
             # Re-fetch state (reactions may have updated confirmed_users)
             rdata = await self._get_reminder(guild_id, reminder_id)
             if rdata is None or not rdata.get("active", False):
+                log.debug(f"Reminder {reminder_id} stopped: inactive/missing")
                 return
+
+            log.debug(f"Reminder {reminder_id} iteration: confirmed={len(rdata.get('confirmed_users', []))}, required={rdata.get('required_count') or len(rdata['required_users'])}")
 
             # Check all confirmed
             if _all_confirmed(rdata):
                 self._msg_index.pop(rdata.get("current_message_id"), None)
-                await self._try_send(channel, embed=self._build_completion_embed(rdata))
+                log.debug(f"Reminder {reminder_id} completed via reactions.")
                 return
 
             # Check nag expiry
@@ -879,8 +896,16 @@ class RemindConfirm(commands.Cog):
         tz_name = await self.config.guild(ctx.guild).timezone()
         embed = discord.Embed(title="📋 Active reminders", colour=discord.Colour.blurple())
         for rid, r in active.items():
-            pending = _pending_users(r)
-            total = len(r["required_users"])
+            total_mentioned = len(r["required_users"])
+            req_count = r.get("required_count")
+            if req_count is None:
+                req_count = total_mentioned
+
+            confirmed_count = len(r["confirmed_users"])
+            
+            conf_str = f"{confirmed_count}/{req_count}"
+            if req_count < total_mentioned:
+                conf_str += f" (of {total_mentioned} mentioned)"
 
             if r.get("occurrence_started_at"):
                 start_ts = int(datetime.fromisoformat(r["occurrence_started_at"]).timestamp())
@@ -898,9 +923,9 @@ class RemindConfirm(commands.Cog):
                 f"**Message:** {r['message']}",
                 f"**Schedule:** {_format_schedule(r, tz_name=tz_name)}",
                 next_fire_line,
-                f"**Confirmations:** {total - len(pending)}/{total}",
+                f"**Confirmations:** {conf_str}",
             ]
-            if pending:
+            if _pending_users(r): # Use _pending_users(r) to check if there are any pending users
                 value_lines.append(f"**Waiting on:** {_pending_mentions(r)}")
 
             embed.add_field(name=f"`{rid}`", value="\n".join(value_lines), inline=False)
