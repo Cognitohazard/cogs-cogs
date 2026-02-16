@@ -133,8 +133,9 @@ def _pending_users(rdata: dict) -> List[int]:
 
 
 def _all_confirmed(rdata: dict) -> bool:
-    """Check whether every required user has confirmed."""
-    return set(rdata["required_users"]).issubset(rdata["confirmed_users"])
+    """Check whether sufficient users have confirmed."""
+    required = rdata.get("required_count", len(rdata["required_users"]))
+    return len(rdata["confirmed_users"]) >= required
 
 
 def _pending_mentions(rdata: dict) -> str:
@@ -163,21 +164,21 @@ def _format_schedule(rdata: dict, tz_name: str = "UTC") -> str:
 
 
 def _make_reminder(
-    *,
     rid: str,
     channel_id: int,
     message: str,
     schedule_type: str,
-    nag_interval: Optional[str],
-    nag_expiry: str,
-    next_fire_at: datetime,
     required_users: List[int],
     creator_id: int,
     schedule_interval: Optional[str] = None,
     weekdays: Optional[List[int]] = None,
     fire_time: Optional[str] = None,
+    nag_interval: Optional[str] = None,
+    nag_expiry: Optional[str] = None,
+    next_fire_at: Optional[datetime] = None,
+    required_count: Optional[int] = None,
 ) -> dict:
-    """Create a canonical reminder dict with all required fields."""
+    """Create a new reminder dict."""
     return {
         "reminder_id": rid,
         "channel_id": channel_id,
@@ -188,14 +189,16 @@ def _make_reminder(
         "fire_time": fire_time,
         "nag_interval": nag_interval,
         "nag_expiry": nag_expiry,
-        "next_fire_at": next_fire_at.isoformat(),
+        "next_fire_at": next_fire_at.isoformat() if next_fire_at else None,
         "required_users": required_users,
+        "required_count": required_count,
         "confirmed_users": [],
+        "creator_id": creator_id,
+        "active": True,
+        "created_at": datetime.now(timezone.utc).isoformat(),
         "current_message_id": None,
         "occurrence_started_at": None,
-        "creator_id": creator_id,
         "emoji": "✅",
-        "active": True,
     }
 
 
@@ -258,19 +261,21 @@ class RemindConfirm(commands.Cog):
 
     def _build_status_embed(self, rdata: dict) -> discord.Embed:
         """Build the recurring nag embed showing confirmation progress."""
-        pending = _pending_users(rdata)
-        total = len(rdata["required_users"])
-        done = total - len(pending)
+        pending_users = _pending_users(rdata)
+        
+        required_count = rdata.get("required_count", len(rdata["required_users"]))
+        confirmed_count = len(rdata["confirmed_users"])
+        needed_count = max(0, required_count - confirmed_count)
 
         embed = discord.Embed(
             title="⏰ Reminder",
             description=f"### {rdata['message']}",
-            colour=discord.Colour.orange() if pending else discord.Colour.green(),
+            colour=discord.Colour.orange() if needed_count > 0 else discord.Colour.green(),
         )
 
-        if pending:
+        if needed_count > 0:
             embed.add_field(
-                name=f"{len(pending)}/{total} confirmations still needed",
+                name=f"{needed_count} more confirmation{'s' if needed_count != 1 else ''} needed (of {required_count} total)",
                 value=f"Waiting on: {_pending_mentions(rdata)}",
                 inline=False,
             )
@@ -618,6 +623,7 @@ class RemindConfirm(commands.Cog):
         nag_expiry: str,
         message: str,
         users: commands.Greedy[discord.Member],
+        required_count: Optional[int] = None,
     ):
         """Create an interval-based reminder.
 
@@ -629,6 +635,7 @@ class RemindConfirm(commands.Cog):
         - `<nag_expiry>` — max nag window per occurrence (e.g. ``24h``)
         - `<message>` — the reminder text (use quotes)
         - `<@users>` — users who must confirm
+        - `[required_count]` — (Optional) number of confirmations needed (e.g. 2). Default: all.
         """
         tz_name = await self.config.guild(ctx.guild).timezone()
         try:
@@ -657,6 +664,9 @@ class RemindConfirm(commands.Cog):
             return await ctx.send("❌ You must mention at least one user to confirm.")
 
         rid = uuid.uuid4().hex[:8]
+        if required_count is not None and (required_count < 1 or required_count > len(users)):
+            return await ctx.send(f"❌ Required count must be between 1 and {len(users)}.")
+
         rdata = _make_reminder(
             rid=rid,
             channel_id=ctx.channel.id,
@@ -668,6 +678,7 @@ class RemindConfirm(commands.Cog):
             next_fire_at=fire_dt,
             required_users=[u.id for u in users],
             creator_id=ctx.author.id,
+            required_count=required_count,
         )
 
         await self._save_reminder(ctx.guild.id, rid, rdata)
@@ -686,6 +697,7 @@ class RemindConfirm(commands.Cog):
         nag_expiry: str,
         message: str,
         users: commands.Greedy[discord.Member],
+        required_count: Optional[int] = None,
     ):
         """Create a weekly reminder.
 
@@ -697,6 +709,7 @@ class RemindConfirm(commands.Cog):
         - `<nag_expiry>` — max nag window (e.g. ``8h``)
         - `<message>` — the reminder text (use quotes)
         - `<@users>` — users who must confirm
+        - `[required_count]` — (Optional) number of confirmations needed. Default: all.
         """
         weekdays = parse_weekdays(days)
         if weekdays is None:
@@ -728,6 +741,9 @@ class RemindConfirm(commands.Cog):
         fire_dt = next_weekly_fire(weekdays, hour, minute, tz=tz)
 
         rid = uuid.uuid4().hex[:8]
+        if required_count is not None and (required_count < 1 or required_count > len(users)):
+            return await ctx.send(f"❌ Required count must be between 1 and {len(users)}.")
+
         rdata = _make_reminder(
             rid=rid,
             channel_id=ctx.channel.id,
@@ -740,6 +756,7 @@ class RemindConfirm(commands.Cog):
             next_fire_at=fire_dt,
             required_users=[u.id for u in users],
             creator_id=ctx.author.id,
+            required_count=required_count,
         )
 
         await self._save_reminder(ctx.guild.id, rid, rdata)
@@ -755,6 +772,7 @@ class RemindConfirm(commands.Cog):
         when: str,
         message: str,
         users: commands.Greedy[discord.Member],
+        required_count: Optional[int] = None,
     ):
         """Create a one-shot reminder (no recurring nag).
 
@@ -764,8 +782,9 @@ class RemindConfirm(commands.Cog):
         - `<when>`: ISO datetime (server timezone) or relative (e.g. `in 2h`).
         - `<message>`: The reminder text.
         - `<@users>`: Users who must confirm.
+        - `[required_count]`: (Optional) number of confirmations needed.
         """
-        await self._create_once(ctx, when, None, "24h", message, users)
+        await self._create_once(ctx, when, None, "24h", message, users, required_count)
 
     @rc.command(name="once_nag")
     @commands.guild_only()
@@ -778,6 +797,7 @@ class RemindConfirm(commands.Cog):
         nag_expiry: str,
         message: str,
         users: commands.Greedy[discord.Member],
+        required_count: Optional[int] = None,
     ):
         """Create a one-shot reminder with a repeating nag loop.
 
@@ -787,8 +807,9 @@ class RemindConfirm(commands.Cog):
         - `<nag_expiry>`: When to stop nagging (e.g. `24h`).
         - `<message>`: Reminder text.
         - `<@users>`: Required users.
+        - `[required_count]`: (Optional) number of confirmations needed.
         """
-        await self._create_once(ctx, when, nag_interval, nag_expiry, message, users)
+        await self._create_once(ctx, when, nag_interval, nag_expiry, message, users, required_count)
 
     async def _create_once(
         self,
@@ -798,6 +819,7 @@ class RemindConfirm(commands.Cog):
         nag_expiry: str,
         message: str,
         users: List[discord.Member],
+        required_count: Optional[int] = None,
     ):
         tz_name = await self.config.guild(ctx.guild).timezone()
         try:
@@ -824,6 +846,9 @@ class RemindConfirm(commands.Cog):
             return await ctx.send("❌ You must mention at least one user to confirm.")
 
         rid = uuid.uuid4().hex[:8]
+        if required_count is not None and (required_count < 1 or required_count > len(users)):
+            return await ctx.send(f"❌ Required count must be between 1 and {len(users)}.")
+
         rdata = _make_reminder(
             rid=rid,
             channel_id=ctx.channel.id,
@@ -834,6 +859,7 @@ class RemindConfirm(commands.Cog):
             next_fire_at=fire_dt,
             required_users=[u.id for u in users],
             creator_id=ctx.author.id,
+            required_count=required_count,
         )
 
         await self._save_reminder(ctx.guild.id, rid, rdata)
