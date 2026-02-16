@@ -413,11 +413,33 @@ class RemindConfirm(commands.Cog):
             log.error("Invalid nag_expiry for reminder %s", reminder_id)
             return
 
-        occurrence_start = datetime.now(timezone.utc)
         async with self.config.guild_from_id(guild_id).reminders() as reminders:
             rdata = reminders.get(reminder_id, rdata)
+            
+            # Use persisted 'next_fire_at' as the authoritative start time
+            # This ensures that if the bot restarts during an active window,
+            # we resume counting from the original fire time (not 'now').
+            try:
+                if rdata.get("next_fire_at"):
+                    occurrence_start = datetime.fromisoformat(rdata["next_fire_at"])
+                else:
+                    occurrence_start = datetime.now(timezone.utc)
+            except ValueError:
+                occurrence_start = datetime.now(timezone.utc)
+
+            # Ensure occurrence_start is in UTC (cleanup offset if mismatch)
+            if occurrence_start.tzinfo is None:
+                occurrence_start = occurrence_start.replace(tzinfo=timezone.utc)
+
+            # Save explicit start time for UI display (rc list)
             rdata["occurrence_started_at"] = occurrence_start.isoformat()
-            rdata["confirmed_users"] = []
+            
+            # If starting fresh (no existing confirmations), ensure list is empty
+            if "confirmed_users" not in rdata:
+                rdata["confirmed_users"] = []
+            
+            # Persist state
+            reminders[reminder_id] = rdata
 
         first_iteration = True
         while True:
