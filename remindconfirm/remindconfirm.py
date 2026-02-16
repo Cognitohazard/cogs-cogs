@@ -154,6 +154,8 @@ def _format_schedule(rdata: dict, tz_name: str = "UTC") -> str:
     elif rdata["schedule_type"] == "weekly":
         days_display = ", ".join(DAY_ABBREVS[d] for d in rdata.get("weekdays", []))
         return f"**{days_display}** at **{rdata.get('fire_time', '??')}** {tz_name}"
+    elif rdata["schedule_type"] == "once":
+        return "Run once"
     return "Unknown"
 
 
@@ -166,7 +168,7 @@ def _make_reminder(
     channel_id: int,
     message: str,
     schedule_type: str,
-    nag_interval: str,
+    nag_interval: Optional[str],
     nag_expiry: str,
     next_fire_at: datetime,
     required_users: List[int],
@@ -368,6 +370,12 @@ class RemindConfirm(commands.Cog):
                 if rdata is None or not rdata.get("active", False):
                     break
 
+                # If one-shot, we are done
+                if rdata["schedule_type"] == "once":
+                    rdata["active"] = False
+                    await self._save_reminder(guild_id, reminder_id, rdata)
+                    break
+
                 # Schedule next fire
                 tz_name = await self.config.guild_from_id(guild_id).timezone()
                 try:
@@ -399,10 +407,10 @@ class RemindConfirm(commands.Cog):
         if channel is None:
             return
 
-        nag_interval = parse_duration(rdata["nag_interval"])
+        nag_interval = parse_duration(rdata["nag_interval"]) if rdata["nag_interval"] else None
         nag_expiry = parse_duration(rdata["nag_expiry"])
-        if nag_interval is None or nag_expiry is None:
-            log.error("Invalid nag_interval or nag_expiry for reminder %s", reminder_id)
+        if nag_expiry is None:
+            log.error("Invalid nag_expiry for reminder %s", reminder_id)
             return
 
         occurrence_start = datetime.now(timezone.utc)
@@ -416,10 +424,18 @@ class RemindConfirm(commands.Cog):
             # On first iteration we send immediately; on subsequent ones we sleep first
             if not first_iteration:
                 remaining_expiry = nag_expiry - (datetime.now(timezone.utc) - occurrence_start)
-                sleep_time = min(nag_interval, remaining_expiry)
+                if nag_interval:
+                    sleep_time = min(nag_interval, remaining_expiry)
+                else:
+                    # Polling mode for "once" without nag: check every minute
+                    sleep_time = min(timedelta(seconds=60), remaining_expiry)
+                
                 sleep_secs = max(sleep_time.total_seconds(), 0)
                 if sleep_secs > 0:
                     await asyncio.sleep(sleep_secs)
+            
+            # Send/Re-send logic
+            should_send = first_iteration or (nag_interval is not None)
             first_iteration = False
 
             # Re-fetch state (reactions may have updated confirmed_users)
@@ -452,21 +468,22 @@ class RemindConfirm(commands.Cog):
                     pass
 
             # Send new reminder message (ping only pending users)
-            embed = self._build_status_embed(rdata)
-            content = " ".join(f"<@{uid}>" for uid in _pending_users(rdata))
-            try:
-                new_msg = await channel.send(content=content, embed=embed)
-                await new_msg.add_reaction(rdata["emoji"])
-            except discord.HTTPException:
-                log.exception("Failed to send reminder message for %s", reminder_id)
-                return
+            if should_send:
+                embed = self._build_status_embed(rdata)
+                content = " ".join(f"<@{uid}>" for uid in _pending_users(rdata))
+                try:
+                    new_msg = await channel.send(content=content, embed=embed)
+                    await new_msg.add_reaction(rdata["emoji"])
+                except discord.HTTPException:
+                    log.exception("Failed to send reminder message for %s", reminder_id)
+                    return
 
-            # Update state and index atomically
-            self._msg_index[new_msg.id] = (guild_id, reminder_id)
-            async with self.config.guild_from_id(guild_id).reminders() as reminders:
-                r = reminders.get(reminder_id)
-                if r is not None:
-                    r["current_message_id"] = new_msg.id
+                # Update state and index atomically
+                self._msg_index[new_msg.id] = (guild_id, reminder_id)
+                async with self.config.guild_from_id(guild_id).reminders() as reminders:
+                    r = reminders.get(reminder_id)
+                    if r is not None:
+                        r["current_message_id"] = new_msg.id
 
     async def _try_send(self, channel: discord.abc.Messageable, **kwargs) -> None:
         """Send a message, swallowing HTTPExceptions."""
@@ -687,6 +704,85 @@ class RemindConfirm(commands.Cog):
             schedule_type="weekly",
             weekdays=weekdays,
             fire_time=time,
+            nag_interval=nag_interval,
+            nag_expiry=nag_expiry,
+            next_fire_at=fire_dt,
+            required_users=[u.id for u in users],
+            creator_id=ctx.author.id,
+        )
+
+        await self._save_reminder(ctx.guild.id, rid, rdata)
+        self._schedule_task(ctx.guild.id, rid, rdata)
+        await ctx.send(embed=self._build_creation_embed(rdata, fire_dt, users, tz_name=tz_name))
+
+    @rc.command(name="once")
+    @commands.guild_only()
+    @commands.admin_or_permissions(manage_guild=True)
+    async def rc_once(
+        self,
+        ctx: commands.Context,
+        when: str,
+        message: str,
+        users: commands.Greedy[discord.Member],
+    ):
+        """Create a one-shot reminder (no recurring nag).
+
+        Stays active for 24h waiting for confirmation, then expires.
+        """
+        await self._create_once(ctx, when, None, "24h", message, users)
+
+    @rc.command(name="once_nag")
+    @commands.guild_only()
+    @commands.admin_or_permissions(manage_guild=True)
+    async def rc_once_nag(
+        self,
+        ctx: commands.Context,
+        when: str,
+        nag_interval: str,
+        nag_expiry: str,
+        message: str,
+        users: commands.Greedy[discord.Member],
+    ):
+        """Create a one-shot reminder with a nag loop."""
+        await self._create_once(ctx, when, nag_interval, nag_expiry, message, users)
+
+    async def _create_once(
+        self,
+        ctx: commands.Context,
+        when: str,
+        nag_interval: Optional[str],
+        nag_expiry: str,
+        message: str,
+        users: List[discord.Member],
+    ):
+        tz_name = await self.config.guild(ctx.guild).timezone()
+        try:
+            tz = ZoneInfo(tz_name)
+        except (ZoneInfoNotFoundError, KeyError):
+            tz = None
+
+        fire_dt = parse_fire_time(when, tz=tz)
+        if fire_dt is None:
+            return await ctx.send('❌ Invalid fire time. Use ISO format or `in 2h`.')
+        if fire_dt < datetime.now(timezone.utc):
+            return await ctx.send('❌ Fire time is in the past.')
+
+        if nag_interval and parse_duration(nag_interval) is None:
+            return await ctx.send("❌ Invalid nag interval.")
+        if parse_duration(nag_expiry) is None:
+            return await ctx.send("❌ Invalid nag expiry.")
+        if nag_interval and parse_duration(nag_expiry) < parse_duration(nag_interval):
+            return await ctx.send("❌ Nag expiry must be ≥ nag interval.")
+
+        if not users:
+            return await ctx.send("❌ You must mention at least one user to confirm.")
+
+        rid = uuid.uuid4().hex[:8]
+        rdata = _make_reminder(
+            rid=rid,
+            channel_id=ctx.channel.id,
+            message=message,
+            schedule_type="once",
             nag_interval=nag_interval,
             nag_expiry=nag_expiry,
             next_fire_at=fire_dt,
