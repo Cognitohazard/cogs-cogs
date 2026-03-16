@@ -1,0 +1,6 @@
+{
+    "author": ["Cognitohazard"],
+    "description": "A collection of cogs for Red-DiscordBot.",
+    "install_msg": "Thanks for adding this repo! Use `[p]cog list cogs-cogs` to see available cogs.",
+    "short": "Cogs by Cognitohazard"
+}
